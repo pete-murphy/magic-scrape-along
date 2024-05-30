@@ -1,15 +1,12 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -22,15 +19,17 @@ module Main where
 import Conduit (MonadThrow)
 import Control.Applicative (optional)
 import Control.Arrow ((<<<), (>>>))
-import Control.Concurrent (threadDelay)
-import Control.Monad (forever)
+import Control.Monad (forever, unless)
 import Control.Monad.Fix (fix)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (MonadReader, ReaderT (runReaderT), asks)
+import Control.Monad.State (MonadState (..), evalStateT)
 import Data.Aeson (ToJSON, encode)
 import Data.ByteString qualified as BS
 import Data.Char (isUpper, toLower)
 import Data.Foldable (for_)
+import Data.Function ((&))
+import Data.Functor ((<&>))
 import Data.String (IsString)
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
@@ -42,11 +41,21 @@ import GHC.IO.Handle.FD (withFile)
 import GHC.TypeLits (Symbol)
 import Network.HTTP.Client (Manager, ManagerSettings (..), Request (..), Response (..), brRead, newManager, parseRequest, withResponse)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Network.HTTP.Types (hUserAgent)
-import Pipes (Pipe, Producer, await, each, runEffect, (>->))
+import Network.HTTP.Types (hContentLength, hUserAgent)
+import Pipes (Consumer, Producer, await, each, runEffect, (>->))
 import Pipes.Prelude qualified as P
+import System.Console.ANSI (setCursorColumn)
+import System.Directory (createDirectory, getCurrentDirectory)
+import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode))
 import Text.HTML.Scalpel (Config (..), attr, chroot, chroots, defaultDecoder, hasClass, scrapeURLWithConfig, text, (//), (@:), (@=))
+import Text.Read (readMaybe)
+
+baseURL :: PageURL
+baseURL = "https://www.magicreadalong.com"
+
+audioDirectory :: FilePath
+audioDirectory = "audio"
 
 main :: IO ()
 main = do
@@ -58,20 +67,18 @@ main = do
           }
 
   manager <- newManager settings
+  createDirectory audioDirectory
+  cwd <- getCurrentDirectory
 
-  flip runReaderT (Env manager) do
+  flip runReaderT (Env manager cwd) do
     runEffect do
       scraper "/"
-        >-> P.tee
-          ( P.map podcastAudioURL
-              >-> downloadAudioURL
-              >-> P.map (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
-              >-> P.stdoutLn
-          )
+        >-> P.tee (P.map podcastAudioURL >-> downloadAudioURL)
         >-> P.map (encode >>> TL.decodeUtf8 >>> TL.unpack)
+        >-> P.tee writeJSON
         >-> P.stdoutLn
 
-newtype Env = Env {envManager :: Manager}
+data Env = Env {envManager :: Manager, envCWD :: FilePath}
 
 scraper ::
   (MonadIO m, MonadFail m, MonadReader Env m) =>
@@ -104,35 +111,64 @@ scraper =
         nextPath <- optional (PageURL <$> attr "href" ("a" @: ["id" @= "nextLink"]))
 
         pure (podcasts, nextPath)
+
     each podcasts
     for_ nextPath loop
 
-baseURL :: PageURL
-baseURL = "https://www.magicreadalong.com"
+writeJSON ::
+  (MonadReader Env m, MonadIO m) =>
+  Consumer String m ()
+writeJSON = do
+  cwd <- asks envCWD
+  forever do
+    podcastJSON <- await
+    liftIO do
+      appendFile
+        (cwd </> audioDirectory </> "podcasts.ndjson")
+        (podcastJSON ++ "\n")
 
 downloadAudioURL ::
   (MonadReader Env m, MonadIO m, MonadThrow m) =>
-  Pipe AudioURL BS.ByteString m ()
+  Consumer AudioURL m ()
 downloadAudioURL = forever do
   url <- unAudioURL <$> await
-  liftIO (threadDelay 100_000)
   let filename =
         TL.unpack (last (TL.splitOn "/" (TL.pack url)))
 
   req <- parseRequest url
   manager <- asks envManager
+  cwd <- asks envCWD
 
   liftIO do
     putStrLn ("Downloading " <> filename)
-    withFile filename WriteMode \h -> do
-      withResponse req manager \(responseBody -> bodyReader) -> do
-        fix \loop -> do
-          bs <- brRead bodyReader
-          if BS.null bs
-            then pure ()
-            else do
-              BS.hPut h bs
+    withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
+      withResponse req manager \resp -> do
+        flip evalStateT 0 do
+          let bodyReader = responseBody resp
+              maybeContentLength =
+                responseHeaders resp
+                  & lookup hContentLength
+                  <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
+                  >>= readMaybe @Int
+
+          fix \loop -> do
+            bs <- liftIO (brRead bodyReader)
+            downloaded <- get
+            let nextDownloaded = downloaded + BS.length bs
+            for_ maybeContentLength \contentLength -> liftIO do
+              let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
+              setCursorColumn 0
+              putStr (renderRatio ratio)
+            put nextDownloaded
+            unless (BS.null bs) do
+              liftIO (BS.hPut h bs)
               loop
+
+renderRatio :: Double -> String
+renderRatio n = do
+  let width = 50
+      m = round (n * fromIntegral width)
+  replicate m '█' <> replicate (width - m) '░'
 
 data Podcast = Podcast
   { podcastTitle :: String,

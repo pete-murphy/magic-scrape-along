@@ -27,10 +27,15 @@ executable magic-scrape
   -- Other library packages from which modules are imported.
   build-depends:
     , aeson
+    , ansi-terminal
     , base
     , bytestring
     , conduit
+    , containers
     , deriving-aeson
+    , directory
+    , filepath
+    , generic-lens
     , http-client
     , http-client-tls
     , http-conduit
@@ -42,6 +47,7 @@ executable magic-scrape
     , scalpel
     , text
     , time
+    , unliftio
 
   -- Directories containing source files.
   hs-source-dirs:   app

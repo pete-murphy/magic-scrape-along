@@ -1,2 +1,3 @@
 dist-newstyle/
-audio/
+audio*/
+.DS_Store

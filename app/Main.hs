@@ -19,7 +19,8 @@ module Main where
 import Conduit (MonadThrow)
 import Control.Applicative (optional)
 import Control.Arrow ((<<<), (>>>))
-import Control.Monad (forever, unless)
+import Control.Concurrent (forkIO, newEmptyMVar, withMVar)
+import Control.Monad (forever, replicateM_, unless)
 import Control.Monad.Fix (fix)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (MonadReader, ReaderT (runReaderT), asks)
@@ -55,7 +56,7 @@ baseURL :: PageURL
 baseURL = "https://www.magicreadalong.com"
 
 audioDirectory :: FilePath
-audioDirectory = "audio"
+audioDirectory = "audio-3"
 
 main :: IO ()
 main = do
@@ -73,12 +74,15 @@ main = do
   flip runReaderT (Env manager cwd) do
     runEffect do
       scraper "/"
-        >-> P.tee (P.map podcastAudioURL >-> downloadAudioURL)
+        >-> P.tee (P.map podcastAudioURL >-> replicateM_ 3 downloadAudioURL)
         >-> P.map (encode >>> TL.decodeUtf8 >>> TL.unpack)
         >-> P.tee writeJSON
         >-> P.stdoutLn
 
-data Env = Env {envManager :: Manager, envCWD :: FilePath}
+data Env = Env
+  { envManager :: Manager,
+    envCWD :: FilePath
+  }
 
 scraper ::
   (MonadIO m, MonadFail m, MonadReader Env m) =>
@@ -140,29 +144,32 @@ downloadAudioURL = forever do
   cwd <- asks envCWD
 
   liftIO do
-    putStrLn ("Downloading " <> filename)
-    withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
-      withResponse req manager \resp -> do
-        flip evalStateT 0 do
-          let bodyReader = responseBody resp
-              maybeContentLength =
-                responseHeaders resp
-                  & lookup hContentLength
-                  <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
-                  >>= readMaybe @Int
+    mVar <- newEmptyMVar
+    withMVar mVar \_ -> do
+      forkIO do
+        putStrLn ("Downloading " <> filename)
+        withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
+          withResponse req manager \resp -> do
+            flip evalStateT 0 do
+              let bodyReader = responseBody resp
+                  maybeContentLength =
+                    responseHeaders resp
+                      & lookup hContentLength
+                      <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
+                      >>= readMaybe @Int
 
-          fix \loop -> do
-            bs <- liftIO (brRead bodyReader)
-            downloaded <- get
-            let nextDownloaded = downloaded + BS.length bs
-            for_ maybeContentLength \contentLength -> liftIO do
-              let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
-              setCursorColumn 0
-              putStr (renderRatio ratio)
-            put nextDownloaded
-            unless (BS.null bs) do
-              liftIO (BS.hPut h bs)
-              loop
+              fix \loop -> do
+                bs <- liftIO (brRead bodyReader)
+                downloaded <- get
+                let nextDownloaded = downloaded + BS.length bs
+                for_ maybeContentLength \contentLength -> liftIO do
+                  let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
+                  setCursorColumn 0
+                  putStr (renderRatio ratio)
+                put nextDownloaded
+                unless (BS.null bs) do
+                  liftIO (BS.hPut h bs)
+                  loop
 
 renderRatio :: Double -> String
 renderRatio n = do

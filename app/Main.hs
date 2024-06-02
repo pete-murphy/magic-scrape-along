@@ -19,8 +19,8 @@ module Main where
 import Conduit (MonadThrow)
 import Control.Applicative (optional)
 import Control.Arrow ((<<<), (>>>))
-import Control.Concurrent (forkIO, newEmptyMVar, withMVar)
-import Control.Monad (forever, replicateM_, unless)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, withMVar)
+import Control.Monad (forever, replicateM_, unless, void)
 import Control.Monad.Fix (fix)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (MonadReader, ReaderT (runReaderT), asks)
@@ -56,7 +56,7 @@ baseURL :: PageURL
 baseURL = "https://www.magicreadalong.com"
 
 audioDirectory :: FilePath
-audioDirectory = "audio-3"
+audioDirectory = "audio-4"
 
 main :: IO ()
 main = do
@@ -145,31 +145,32 @@ downloadAudioURL = forever do
 
   liftIO do
     mVar <- newEmptyMVar
-    withMVar mVar \_ -> do
-      forkIO do
-        putStrLn ("Downloading " <> filename)
-        withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
-          withResponse req manager \resp -> do
-            flip evalStateT 0 do
-              let bodyReader = responseBody resp
-                  maybeContentLength =
-                    responseHeaders resp
-                      & lookup hContentLength
-                      <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
-                      >>= readMaybe @Int
+    _ <- forkIO do
+      putStrLn ("Downloading " <> filename)
+      withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
+        withResponse req manager \resp -> do
+          flip evalStateT 0 do
+            let bodyReader = responseBody resp
+                maybeContentLength =
+                  responseHeaders resp
+                    & lookup hContentLength
+                    <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
+                    >>= readMaybe @Int
 
-              fix \loop -> do
-                bs <- liftIO (brRead bodyReader)
-                downloaded <- get
-                let nextDownloaded = downloaded + BS.length bs
-                for_ maybeContentLength \contentLength -> liftIO do
-                  let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
-                  setCursorColumn 0
-                  putStr (renderRatio ratio)
-                put nextDownloaded
-                unless (BS.null bs) do
-                  liftIO (BS.hPut h bs)
-                  loop
+            fix \loop -> do
+              bs <- liftIO (brRead bodyReader)
+              downloaded <- get
+              let nextDownloaded = downloaded + BS.length bs
+              for_ maybeContentLength \contentLength -> liftIO do
+                let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
+                setCursorColumn 0
+                putStr (renderRatio ratio)
+              put nextDownloaded
+              unless (BS.null bs) do
+                liftIO (BS.hPut h bs)
+                loop
+              liftIO (putMVar mVar ())
+    takeMVar mVar
 
 renderRatio :: Double -> String
 renderRatio n = do

@@ -19,8 +19,8 @@ module Main where
 import Conduit (MonadThrow)
 import Control.Applicative (optional)
 import Control.Arrow ((<<<), (>>>))
-import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, withMVar)
-import Control.Monad (forever, replicateM_, unless, void)
+import Control.Concurrent (forkIO, newMVar, putMVar, takeMVar, threadDelay)
+import Control.Monad (forever, replicateM_, unless)
 import Control.Monad.Fix (fix)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (MonadReader, ReaderT (runReaderT), asks)
@@ -134,43 +134,45 @@ writeJSON = do
 downloadAudioURL ::
   (MonadReader Env m, MonadIO m, MonadThrow m) =>
   Consumer AudioURL m ()
-downloadAudioURL = forever do
-  url <- unAudioURL <$> await
-  let filename =
-        TL.unpack (last (TL.splitOn "/" (TL.pack url)))
+downloadAudioURL = do
+  mVar <- liftIO (newMVar ())
+  forever do
+    url <- unAudioURL <$> await
+    let filename =
+          TL.unpack (last (TL.splitOn "/" (TL.pack url)))
 
-  req <- parseRequest url
-  manager <- asks envManager
-  cwd <- asks envCWD
+    req <- parseRequest url
+    manager <- asks envManager
+    cwd <- asks envCWD
 
-  liftIO do
-    mVar <- newEmptyMVar
-    _ <- forkIO do
-      putStrLn ("Downloading " <> filename)
-      withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
-        withResponse req manager \resp -> do
-          flip evalStateT 0 do
-            let bodyReader = responseBody resp
-                maybeContentLength =
-                  responseHeaders resp
-                    & lookup hContentLength
-                    <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
-                    >>= readMaybe @Int
+    liftIO do
+      forkIO do
+        takeMVar mVar
+        putStrLn ("Downloading " <> filename)
+        threadDelay 1000000
+        withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
+          withResponse req manager \resp -> do
+            flip evalStateT 0 do
+              let bodyReader = responseBody resp
+                  maybeContentLength =
+                    responseHeaders resp
+                      & lookup hContentLength
+                      <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
+                      >>= readMaybe @Int
 
-            fix \loop -> do
-              bs <- liftIO (brRead bodyReader)
-              downloaded <- get
-              let nextDownloaded = downloaded + BS.length bs
-              for_ maybeContentLength \contentLength -> liftIO do
-                let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
-                setCursorColumn 0
-                putStr (renderRatio ratio)
-              put nextDownloaded
-              unless (BS.null bs) do
-                liftIO (BS.hPut h bs)
-                loop
-              liftIO (putMVar mVar ())
-    takeMVar mVar
+              fix \loop -> do
+                bs <- liftIO (brRead bodyReader)
+                downloaded <- get
+                let nextDownloaded = downloaded + BS.length bs
+                for_ maybeContentLength \contentLength -> liftIO do
+                  let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
+                  setCursorColumn 0
+                  putStr (renderRatio ratio)
+                put nextDownloaded
+                unless (BS.null bs) do
+                  liftIO (BS.hPut h bs)
+                  loop
+        liftIO (putMVar mVar ())
 
 renderRatio :: Double -> String
 renderRatio n = do

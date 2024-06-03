@@ -19,9 +19,10 @@ module Main where
 
 import Control.Applicative (optional)
 import Control.Arrow ((<<<), (>>>))
-import Control.Concurrent (QSem, forkIO, newEmptyMVar, newQSem, putMVar, signalQSem, takeMVar, threadDelay, waitQSem)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.Async (async, wait)
 import Control.Lens (ifor_)
-import Control.Monad (forever, replicateM_, unless)
+import Control.Monad (forever, replicateM, replicateM_, unless)
 import Control.Monad.Fix (fix)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (MonadReader, ReaderT (runReaderT), asks)
@@ -41,7 +42,6 @@ import Data.Text.Lazy.Encoding qualified as TL
 import Data.Time (Day, UTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Deriving.Aeson (CustomJSON (..), FieldLabelModifier, StringModifier (..), StripPrefix)
-import Example qualified
 import GHC.Generics (Generic)
 import GHC.IO.Handle.FD (withFile)
 import GHC.IORef (readIORef)
@@ -50,6 +50,7 @@ import Network.HTTP.Client (Manager, ManagerSettings (..), Request (..), Respons
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (hContentLength, hUserAgent)
 import Pipes (Consumer, Producer, await, each, runEffect, (>->))
+import Pipes.Concurrent (fromMailbox, performGC, spawn, toMailbox, unbounded)
 import Pipes.Prelude qualified as P
 import Pipes.Safe (MonadThrow)
 import System.Console.ANSI (clearScreen, setCursorPosition)
@@ -58,7 +59,6 @@ import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode))
 import Text.HTML.Scalpel (Config (..), attr, chroot, chroots, defaultDecoder, hasClass, scrapeURLWithConfig, text, (//), (@:), (@=))
 import Text.Read (readMaybe)
-import Worker qualified
 
 baseURL :: PageURL
 baseURL = "https://www.magicreadalong.com"
@@ -66,11 +66,8 @@ baseURL = "https://www.magicreadalong.com"
 audioDirectory :: FilePath
 audioDirectory = "audio-4"
 
--- main = Example.main''
-main = Worker.main
-
-main' :: IO ()
-main' = do
+main :: IO ()
+main = do
   let settings =
         tlsManagerSettings
           { managerModifyRequest = \req -> do
@@ -82,6 +79,7 @@ main' = do
   createDirectory audioDirectory
   cwd <- getCurrentDirectory
   fileDownloadProgress <- newIORef Map.empty
+  let runWithEnv = flip runReaderT (Env manager cwd fileDownloadProgress)
 
   _ <- forkIO do
     forever do
@@ -97,14 +95,26 @@ main' = do
                 then "✅"
                 else renderProgress progress <> " " <> take 5 (show (progress * 100)) <> "%"
           )
-  qSem <- newQSem 10
 
-  flip runReaderT (Env manager cwd qSem fileDownloadProgress) do
-    runEffect do
-      scraper "/"
-        >-> P.tee (P.map podcastAudioURL >-> replicateM_ 3 downloadAudioURL)
-        >-> P.map (encode >>> TL.decodeUtf8 >>> TL.unpack)
-        >-> writeJSON
+  mailbox <- spawn unbounded
+
+  consumers <-
+    replicateM 10 do
+      async do
+        runWithEnv do
+          runEffect do
+            fromMailbox mailbox
+              >-> P.tee (P.map podcastAudioURL >-> replicateM_ 3 downloadAudioURL)
+              >-> P.map (encode >>> TL.decodeUtf8 >>> TL.unpack)
+              >-> writeJSON
+        performGC
+
+  producers <- async do
+    runWithEnv do
+      runEffect do
+        scraper "/" >-> toMailbox mailbox
+
+  for_ (producers : consumers) wait
 
 fill :: Int -> a -> [a] -> [a]
 fill n x xs = xs <> replicate (n - length xs) x
@@ -115,7 +125,6 @@ renderProgress n = "[" <> replicate (round (n * 20)) '█' <> replicate (20 - ro
 data Env = Env
   { envManager :: Manager,
     envCWD :: FilePath,
-    envQSem :: QSem,
     envFileDownloadProgress :: IORef (Map (UTCTime, String) Double)
   }
 
@@ -171,9 +180,6 @@ downloadAudioURL ::
   Consumer AudioURL m ()
 downloadAudioURL = do
   forever do
-    qSem <- asks envQSem
-    lock <- liftIO newEmptyMVar
-
     url <- unAudioURL <$> await
     now <- liftIO getCurrentTime
     let filename =
@@ -185,32 +191,28 @@ downloadAudioURL = do
     cwd <- asks envCWD
     progress <- asks envFileDownloadProgress
 
-    _ <- liftIO do
-      forkIO do
-        withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
-          withResponse req manager \resp -> do
-            flip evalStateT 0 do
-              let bodyReader = responseBody resp
-                  maybeContentLength =
-                    responseHeaders resp
-                      & lookup hContentLength
-                      <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
-                      >>= readMaybe @Int
+    liftIO do
+      withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
+        withResponse req manager \resp -> do
+          flip evalStateT 0 do
+            let bodyReader = responseBody resp
+                maybeContentLength =
+                  responseHeaders resp
+                    & lookup hContentLength
+                    <&> (BS.fromStrict >>> TL.decodeUtf8 >>> TL.unpack)
+                    >>= readMaybe @Int
 
-              fix \loop -> do
-                bs <- liftIO (brRead bodyReader)
-                downloaded <- get
-                let nextDownloaded = downloaded + BS.length bs
-                for_ maybeContentLength \contentLength -> liftIO do
-                  let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
-                  modifyIORef' progress (Map.insert key ratio)
-                put nextDownloaded
-                unless (BS.null bs) do
-                  liftIO (BS.hPut h bs)
-                  loop
-        signalQSem qSem
-
-    liftIO (waitQSem qSem)
+            fix \loop -> do
+              bs <- liftIO (brRead bodyReader)
+              downloaded <- get
+              let nextDownloaded = downloaded + BS.length bs
+              for_ maybeContentLength \contentLength -> liftIO do
+                let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
+                modifyIORef' progress (Map.insert key ratio)
+              put nextDownloaded
+              unless (BS.null bs) do
+                liftIO (BS.hPut h bs)
+                loop
 
 data Podcast = Podcast
   { podcastTitle :: String,

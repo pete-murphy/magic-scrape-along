@@ -7,6 +7,7 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -16,10 +17,10 @@
 
 module Main where
 
-import Conduit (MonadThrow)
 import Control.Applicative (optional)
 import Control.Arrow ((<<<), (>>>))
-import Control.Concurrent (forkIO, newMVar, putMVar, takeMVar, threadDelay)
+import Control.Concurrent (QSem, forkIO, newEmptyMVar, newQSem, putMVar, signalQSem, takeMVar, threadDelay, waitQSem)
+import Control.Lens (ifor_)
 import Control.Monad (forever, replicateM_, unless)
 import Control.Monad.Fix (fix)
 import Control.Monad.IO.Class (MonadIO (..))
@@ -31,26 +32,33 @@ import Data.Char (isUpper, toLower)
 import Data.Foldable (for_)
 import Data.Function ((&))
 import Data.Functor ((<&>))
+import Data.IORef (IORef, modifyIORef', newIORef)
+import Data.Map (Map)
+import Data.Map qualified as Map
 import Data.String (IsString)
 import Data.Text.Lazy qualified as TL
 import Data.Text.Lazy.Encoding qualified as TL
-import Data.Time (Day)
+import Data.Time (Day, UTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Deriving.Aeson (CustomJSON (..), FieldLabelModifier, StringModifier (..), StripPrefix)
+import Example qualified
 import GHC.Generics (Generic)
 import GHC.IO.Handle.FD (withFile)
+import GHC.IORef (readIORef)
 import GHC.TypeLits (Symbol)
 import Network.HTTP.Client (Manager, ManagerSettings (..), Request (..), Response (..), brRead, newManager, parseRequest, withResponse)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (hContentLength, hUserAgent)
 import Pipes (Consumer, Producer, await, each, runEffect, (>->))
 import Pipes.Prelude qualified as P
-import System.Console.ANSI (setCursorColumn)
+import Pipes.Safe (MonadThrow)
+import System.Console.ANSI (clearScreen, setCursorPosition)
 import System.Directory (createDirectory, getCurrentDirectory)
 import System.FilePath ((</>))
 import System.IO (IOMode (WriteMode))
 import Text.HTML.Scalpel (Config (..), attr, chroot, chroots, defaultDecoder, hasClass, scrapeURLWithConfig, text, (//), (@:), (@=))
 import Text.Read (readMaybe)
+import Worker qualified
 
 baseURL :: PageURL
 baseURL = "https://www.magicreadalong.com"
@@ -58,8 +66,11 @@ baseURL = "https://www.magicreadalong.com"
 audioDirectory :: FilePath
 audioDirectory = "audio-4"
 
-main :: IO ()
-main = do
+-- main = Example.main''
+main = Worker.main
+
+main' :: IO ()
+main' = do
   let settings =
         tlsManagerSettings
           { managerModifyRequest = \req -> do
@@ -70,18 +81,42 @@ main = do
   manager <- newManager settings
   createDirectory audioDirectory
   cwd <- getCurrentDirectory
+  fileDownloadProgress <- newIORef Map.empty
 
-  flip runReaderT (Env manager cwd) do
+  _ <- forkIO do
+    forever do
+      threadDelay 100_000
+      clearScreen
+      setCursorPosition 0 0
+      p <- readIORef fileDownloadProgress
+      ifor_ p \(_, filename) progress -> do
+        putStrLn
+          ( fill 40 '.' (take 40 filename)
+              <> ": "
+              <> if progress == 1
+                then "✅"
+                else renderProgress progress <> " " <> take 5 (show (progress * 100)) <> "%"
+          )
+  qSem <- newQSem 10
+
+  flip runReaderT (Env manager cwd qSem fileDownloadProgress) do
     runEffect do
       scraper "/"
         >-> P.tee (P.map podcastAudioURL >-> replicateM_ 3 downloadAudioURL)
         >-> P.map (encode >>> TL.decodeUtf8 >>> TL.unpack)
-        >-> P.tee writeJSON
-        >-> P.stdoutLn
+        >-> writeJSON
+
+fill :: Int -> a -> [a] -> [a]
+fill n x xs = xs <> replicate (n - length xs) x
+
+renderProgress :: Double -> String
+renderProgress n = "[" <> replicate (round (n * 20)) '█' <> replicate (20 - round (n * 20)) ' ' <> "]"
 
 data Env = Env
   { envManager :: Manager,
-    envCWD :: FilePath
+    envCWD :: FilePath,
+    envQSem :: QSem,
+    envFileDownloadProgress :: IORef (Map (UTCTime, String) Double)
   }
 
 scraper ::
@@ -90,7 +125,7 @@ scraper ::
   Producer Podcast m ()
 scraper =
   fix \loop path -> do
-    manager <- asks (Just . envManager)
+    manager <- asks (Just <<< envManager)
     let config = Config {manager, decoder = defaultDecoder}
         scrape = scrapeURLWithConfig @String config (unPageURL (baseURL <> path))
     Just ((podcasts, nextPath) :: ([Podcast], Maybe PageURL)) <- liftIO do
@@ -103,7 +138,7 @@ scraper =
           podcastLinks <- chroot "ul" do
             chroots "li" do
               linkTitle <- text "a"
-              linkURL <- (mappend baseURL <<< PageURL) <$> attr "href" "a"
+              linkURL <- PageURL <$> attr "href" "a"
               pure Link {..}
           podcastTags <- chroot ("footer" // "div" @: [hasClass "tags"]) do
             chroots "a" do
@@ -135,21 +170,23 @@ downloadAudioURL ::
   (MonadReader Env m, MonadIO m, MonadThrow m) =>
   Consumer AudioURL m ()
 downloadAudioURL = do
-  mVar <- liftIO (newMVar ())
   forever do
+    qSem <- asks envQSem
+    lock <- liftIO newEmptyMVar
+
     url <- unAudioURL <$> await
+    now <- liftIO getCurrentTime
     let filename =
           TL.unpack (last (TL.splitOn "/" (TL.pack url)))
+        key = (now, filename)
 
     req <- parseRequest url
     manager <- asks envManager
     cwd <- asks envCWD
+    progress <- asks envFileDownloadProgress
 
-    liftIO do
+    _ <- liftIO do
       forkIO do
-        takeMVar mVar
-        putStrLn ("Downloading " <> filename)
-        threadDelay 1000000
         withFile (cwd </> audioDirectory </> filename) WriteMode \h -> do
           withResponse req manager \resp -> do
             flip evalStateT 0 do
@@ -166,19 +203,14 @@ downloadAudioURL = do
                 let nextDownloaded = downloaded + BS.length bs
                 for_ maybeContentLength \contentLength -> liftIO do
                   let ratio = fromIntegral nextDownloaded / fromIntegral contentLength
-                  setCursorColumn 0
-                  putStr (renderRatio ratio)
+                  modifyIORef' progress (Map.insert key ratio)
                 put nextDownloaded
                 unless (BS.null bs) do
                   liftIO (BS.hPut h bs)
                   loop
-        liftIO (putMVar mVar ())
+        signalQSem qSem
 
-renderRatio :: Double -> String
-renderRatio n = do
-  let width = 50
-      m = round (n * fromIntegral width)
-  replicate m '█' <> replicate (width - m) '░'
+    liftIO (waitQSem qSem)
 
 data Podcast = Podcast
   { podcastTitle :: String,
